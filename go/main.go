@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -12,27 +13,23 @@ import (
 	"github.com/faiface/beep/wav"
 )
 
-// ----- MIDI File Generation -----
-//
-// We will write a minimal Type‑0 MIDI file manually.
-// The file will have one track containing a tempo event,
-// a 16‑step drum loop (using channel 10, i.e. status bytes 0x99/0x89),
-// and a 4‑chord progression on channel 1 (status 0x90/0x80).
-
 const (
-	sampleRate = 44100 // for audio synthesis
-	bpm        = 80
-	// In MIDI, we use 480 ticks per beat.
-	midiBeatTicks = 480
+	sampleRate    = 44100 // Audio sample rate.
+	bpm           = 80    // Beats per minute.
+	midiBeatTicks = 480   // Ticks per beat in MIDI.
 )
 
-// midiEvent represents a MIDI event with an absolute tick and its data bytes.
+// =======================
+// MIDI Generation Helpers
+// =======================
+
+// midiEvent represents a MIDI event with an absolute tick value.
 type midiEvent struct {
-	tick int
-	data []byte
+	tick int    // Absolute tick time.
+	data []byte // Event data bytes.
 }
 
-// encodeVarLen encodes an integer as a variable-length quantity.
+// encodeVarLen encodes an integer as a MIDI variable-length quantity.
 func encodeVarLen(value int) []byte {
 	var buffer []byte
 	buffer = append(buffer, byte(value&0x7F))
@@ -45,28 +42,45 @@ func encodeVarLen(value int) []byte {
 	return buffer
 }
 
-// saveMIDI creates a MIDI file named filename.
-func saveMIDI(filename string, drumPattern []uint8, chords [][]uint8) error {
+// saveMIDI creates a minimal Type‑0 MIDI file that fills the track for durationSec seconds.
+// It repeats the drum pattern and chord progression, adding random velocity variation,
+// hi‐hat skips, and sometimes arpeggiated chords.
+func saveMIDI(filename string, durationSec float64, drumPattern []uint8, chords [][]uint8) error {
+	// Calculate total number of beats in the track.
+	totalBeats := int(durationSec * float64(bpm) / 60.0)
 	var events []midiEvent
 
-	// Tempo meta event at tick 0.
-	// 80 BPM => 60/80 * 1e6 = 750000 microseconds per quarter note.
+	// Add a tempo meta event at tick 0.
+	// For 80 BPM: 60/80 * 1e6 = 750000 microseconds per quarter note.
 	events = append(events, midiEvent{
 		tick: 0,
 		data: []byte{0xFF, 0x51, 0x03, 0x0B, 0x71, 0xB0},
 	})
 
-	// Drum loop: use 16 beats (each beat = 480 ticks).
-	// For each beat, if drumPattern[i] is nonzero, add a Note On
-	// at the beat start and a Note Off 240 ticks later.
-	for i := 0; i < 16; i++ {
-		tick := i * midiBeatTicks
-		note := drumPattern[i%len(drumPattern)]
+	// --- Drum Events ---
+	// For each beat, use the drumPattern (assumed to be 16 steps) in round-robin.
+	for beat := 0; beat < totalBeats; beat++ {
+		tick := beat * midiBeatTicks
+		note := drumPattern[beat%len(drumPattern)]
 		if note != 0 {
-			// Drum channel: channel 10 is 0x99 for note-on, 0x89 for note-off.
+			var velocity uint8
+			switch note {
+			case 36: // Kick: velocity between 90-110.
+				velocity = uint8(90 + rand.Intn(21))
+			case 38: // Snare: velocity between 80-100.
+				velocity = uint8(80 + rand.Intn(21))
+			case 42: // Hi-hat: sometimes skip for variety.
+				if rand.Float64() < 0.3 {
+					continue
+				}
+				velocity = uint8(70 + rand.Intn(31))
+			default:
+				velocity = 100
+			}
+			// Channel 10: Note-on is 0x99 and note-off is 0x89.
 			events = append(events, midiEvent{
 				tick: tick,
-				data: []byte{0x99, note, 100},
+				data: []byte{0x99, note, velocity},
 			})
 			events = append(events, midiEvent{
 				tick: tick + 240,
@@ -75,35 +89,61 @@ func saveMIDI(filename string, drumPattern []uint8, chords [][]uint8) error {
 		}
 	}
 
-	// Chord progression: assume 4 chords, each lasting 4 beats (4*480 = 1920 ticks).
-	for j, chord := range chords {
-		startTick := j * 1920
-		endTick := startTick + 1920
-		for _, note := range chord {
-			// Channel 1: 0x90 for note on, 0x80 for note off.
-			events = append(events, midiEvent{
-				tick: startTick,
-				data: []byte{0x90, note, 80},
-			})
-			events = append(events, midiEvent{
-				tick: endTick,
-				data: []byte{0x80, note, 0},
-			})
+	// --- Chord Events ---
+	// Each chord lasts 4 beats.
+	for chordStartBeat := 0; chordStartBeat < totalBeats; chordStartBeat += 4 {
+		chord := chords[(chordStartBeat/4)%len(chords)]
+		chordStartTick := chordStartBeat * midiBeatTicks
+		chordEndTick := (chordStartBeat + 4) * midiBeatTicks
+		// Randomly decide to arpeggiate (50% chance) or play as block chord.
+		if rand.Float64() < 0.5 {
+			deltaIncrement := 30 // ticks offset between notes
+			currentTick := chordStartTick
+			for _, note := range chord {
+				vel := uint8(70 + rand.Intn(21))
+				events = append(events, midiEvent{
+					tick: currentTick,
+					data: []byte{0x90, note, vel},
+				})
+				currentTick += deltaIncrement
+			}
+			currentTick = chordEndTick
+			for _, note := range chord {
+				events = append(events, midiEvent{
+					tick: currentTick,
+					data: []byte{0x80, note, 0},
+				})
+				currentTick += deltaIncrement
+			}
+		} else {
+			for _, note := range chord {
+				vel := uint8(70 + rand.Intn(21))
+				events = append(events, midiEvent{
+					tick: chordStartTick,
+					data: []byte{0x90, note, vel},
+				})
+			}
+			for _, note := range chord {
+				events = append(events, midiEvent{
+					tick: chordEndTick,
+					data: []byte{0x80, note, 0},
+				})
+			}
 		}
 	}
 
-	// End-of-track meta event at tick 16*480.
+	// End-of-track meta event.
 	events = append(events, midiEvent{
-		tick: 16 * midiBeatTicks,
+		tick: totalBeats * midiBeatTicks,
 		data: []byte{0xFF, 0x2F, 0x00},
 	})
 
-	// Sort events by their absolute tick.
+	// Sort events by tick.
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].tick < events[j].tick
 	})
 
-	// Convert absolute ticks to delta times and build track data.
+	// Convert absolute tick values to delta times.
 	var trackData []byte
 	prevTick := 0
 	for _, ev := range events {
@@ -113,20 +153,19 @@ func saveMIDI(filename string, drumPattern []uint8, chords [][]uint8) error {
 		trackData = append(trackData, ev.data...)
 	}
 
-	// Build the MIDI file.
+	// Build MIDI file.
 	var midiFile []byte
-
-	// MIDI header chunk: "MThd", length 6, format 0, 1 track, division = 480.
+	// MIDI header: "MThd", length 6, format 0, 1 track, division 480.
 	header := []byte{
 		'M', 'T', 'h', 'd',
 		0, 0, 0, 6,
-		0, 0, // format 0
-		0, 1, // one track
-		0x01, 0xE0, // division: 480 ticks (0x01E0)
+		0, 0, // Format 0.
+		0, 1, // One track.
+		0x01, 0xE0, // Division: 480 ticks.
 	}
 	midiFile = append(midiFile, header...)
 
-	// Track chunk header.
+	// Track chunk.
 	trackHeader := []byte{'M', 'T', 'r', 'k'}
 	midiFile = append(midiFile, trackHeader...)
 	trackLen := uint32(len(trackData))
@@ -138,23 +177,24 @@ func saveMIDI(filename string, drumPattern []uint8, chords [][]uint8) error {
 	)
 	midiFile = append(midiFile, trackData...)
 
-	// Write the complete MIDI file.
 	return os.WriteFile(filename, midiFile, 0o644)
 }
 
-// generateDrumPattern creates a 16‑step drum pattern.
-// It places a kick (36) on every 4th step,
-// a snare (38) on step 5 (i%8==4),
-// and a hi‑hat (42) on every odd step.
+// =======================
+// Pattern Generation
+// =======================
+
+// generateDrumPattern returns a fixed 16‑step pattern.
+// (The variety is added later in scheduling and audio synthesis.)
 func generateDrumPattern() []uint8 {
 	pattern := make([]uint8, 16)
 	for i := 0; i < 16; i++ {
 		if i%4 == 0 {
-			pattern[i] = 36 // Kick
+			pattern[i] = 36 // Kick.
 		} else if i%8 == 4 {
-			pattern[i] = 38 // Snare
+			pattern[i] = 38 // Snare.
 		} else if i%2 == 1 {
-			pattern[i] = 42 // Hi-hat
+			pattern[i] = 42 // Hi-hat.
 		} else {
 			pattern[i] = 0
 		}
@@ -165,58 +205,64 @@ func generateDrumPattern() []uint8 {
 // generateChordProgression returns a simple chord progression.
 func generateChordProgression() [][]uint8 {
 	return [][]uint8{
-		{60, 64, 67}, // C major
-		{62, 65, 69}, // D minor
-		{67, 71, 74}, // G major
-		{60, 67, 72}, // C major variation
+		{60, 64, 67}, // C major.
+		{62, 65, 69}, // D minor.
+		{67, 71, 74}, // G major.
+		{60, 67, 72}, // C major variation.
 	}
 }
 
-// ----- WAV File (Audio) Synthesis -----
-//
-// We “synthesize” a 10‑second stereo beat by
-// adding drum sounds and chord sounds into a sample buffer.
+// =======================
+// Audio (WAV) Synthesis
+// =======================
 
-// synthesizeBeat generates a stereo buffer (as a slice of [2]float64)
-// of length (durationSec * sampleRate).
+// synthesizeBeat generates a stereo sample buffer for durationSec seconds,
+// adding random variations in envelope decay and amplitude for drums and chords.
 func synthesizeBeat(durationSec float64, drumPattern []uint8, chords [][]uint8) [][2]float64 {
 	totalSamples := sampleRate * int(durationSec)
 	buffer := make([][2]float64, totalSamples)
-
-	// Calculate beat duration in seconds from BPM.
-	beatDurationSec := 60.0 / float64(bpm) // e.g. 0.75 sec at 80 BPM
+	beatDurationSec := 60.0 / float64(bpm)
 	beatSamples := int(beatDurationSec * float64(sampleRate))
 	numBeats := totalSamples / beatSamples
 
-	// --- Drum synthesis ---
+	// --- Drum Synthesis ---
 	for i := 0; i < numBeats; i++ {
 		start := i * beatSamples
 		note := drumPattern[i%len(drumPattern)]
 		if note != 0 {
-			if note == 36 { // Kick: low-frequency sine with fast decay.
+			// Vary overall amplitude for this drum hit.
+			ampFactor := 0.8 + rand.Float64()*0.4 // between 0.8 and 1.2
+			switch note {
+			case 36: // Kick.
 				dur := int(0.2 * float64(sampleRate))
+				decay := 10 + rand.Float64()*5 // vary decay factor.
 				for j := 0; j < dur && start+j < totalSamples; j++ {
 					t := float64(j) / float64(sampleRate)
-					env := math.Exp(-t * 10) // fast decay
-					sample := math.Sin(2*math.Pi*60*t) * env * 0.8
+					env := math.Exp(-t * decay)
+					sample := math.Sin(2*math.Pi*60*t) * env * ampFactor
 					buffer[start+j][0] += sample
 					buffer[start+j][1] += sample
 				}
-			} else if note == 38 { // Snare: noise burst.
+			case 38: // Snare.
 				dur := int(0.2 * float64(sampleRate))
+				decay := 15 + rand.Float64()*5
 				for j := 0; j < dur && start+j < totalSamples; j++ {
 					t := float64(j) / float64(sampleRate)
-					env := math.Exp(-t * 15)
-					sample := ((rand.Float64() * 2) - 1) * env * 0.5
+					env := math.Exp(-t * decay)
+					sample := (((rand.Float64() * 2) - 1) * env * ampFactor)
 					buffer[start+j][0] += sample
 					buffer[start+j][1] += sample
 				}
-			} else if note == 42 { // Hi-hat: shorter noise burst.
+			case 42: // Hi-hat.
+				if rand.Float64() < 0.3 {
+					continue // sometimes skip hi-hat.
+				}
 				dur := int(0.1 * float64(sampleRate))
+				decay := 30 + rand.Float64()*10
 				for j := 0; j < dur && start+j < totalSamples; j++ {
 					t := float64(j) / float64(sampleRate)
-					env := math.Exp(-t * 30)
-					sample := ((rand.Float64() * 2) - 1) * env * 0.3
+					env := math.Exp(-t * decay)
+					sample := (((rand.Float64() * 2) - 1) * env * ampFactor * 0.8)
 					buffer[start+j][0] += sample
 					buffer[start+j][1] += sample
 				}
@@ -224,35 +270,52 @@ func synthesizeBeat(durationSec float64, drumPattern []uint8, chords [][]uint8) 
 		}
 	}
 
-	// --- Chord synthesis ---
-	// We schedule chords for the first four chords.
-	// Each chord lasts 4 beats.
-	chordDurationSamples := beatSamples * 4
-	for j, chord := range chords {
-		start := j * chordDurationSamples
-		end := start + chordDurationSamples
-		if start >= totalSamples {
-			break
+	// --- Chord Synthesis ---
+	// Schedule chords every 4 beats.
+	for chordStartBeat := 0; chordStartBeat < numBeats; chordStartBeat += 4 {
+		chord := chords[(chordStartBeat/4)%len(chords)]
+		startSample := chordStartBeat * beatSamples
+		endSample := (chordStartBeat + 4) * beatSamples
+		if endSample > totalSamples {
+			endSample = totalSamples
 		}
-		if end > totalSamples {
-			end = totalSamples
-		}
-		// For each note in the chord, add a sine wave.
-		for _, note := range chord {
-			// Convert MIDI note number to frequency.
-			freq := 440.0 * math.Pow(2, float64(note-69)/12.0)
-			for i := start; i < end; i++ {
-				t := float64(i-start) / float64(sampleRate)
-				// Use a soft envelope: quick attack then exponential decay.
-				var env float64
-				if t < 0.1 {
-					env = t / 0.1
-				} else {
-					env = math.Exp(-(t - 0.1) * 1.5)
+		chordAmp := 0.18 + rand.Float64()*0.1 // vary chord amplitude.
+		// Randomly decide to arpeggiate.
+		arpeggiate := rand.Float64() < 0.5
+		if arpeggiate {
+			// Each note starts with a small random offset.
+			for _, note := range chord {
+				freq := 440.0 * math.Pow(2, float64(note-69)/12.0)
+				offset := rand.Intn(beatSamples / 8)
+				for i := startSample + offset; i < endSample; i++ {
+					t := float64(i-(startSample+offset)) / float64(beatSamples)
+					var env float64
+					if t < 0.1 {
+						env = t / 0.1
+					} else {
+						env = math.Exp(-(t - 0.1) * (1.5 + rand.Float64()*0.5))
+					}
+					sample := math.Sin(2*math.Pi*freq*t) * env * chordAmp
+					buffer[i][0] += sample
+					buffer[i][1] += sample
 				}
-				sample := math.Sin(2*math.Pi*freq*t) * env * 0.2
-				buffer[i][0] += sample
-				buffer[i][1] += sample
+			}
+		} else {
+			// Block chord.
+			for _, note := range chord {
+				freq := 440.0 * math.Pow(2, float64(note-69)/12.0)
+				for i := startSample; i < endSample; i++ {
+					t := float64(i-startSample) / float64(beatSamples)
+					var env float64
+					if t < 0.1 {
+						env = t / 0.1
+					} else {
+						env = math.Exp(-(t - 0.1) * (1.5 + rand.Float64()*0.5))
+					}
+					sample := math.Sin(2*math.Pi*freq*t) * env * chordAmp
+					buffer[i][0] += sample
+					buffer[i][1] += sample
+				}
 			}
 		}
 	}
@@ -260,8 +323,7 @@ func synthesizeBeat(durationSec float64, drumPattern []uint8, chords [][]uint8) 
 	return buffer
 }
 
-// sliceStreamer is a simple implementation of beep.Streamer that streams
-// a slice of stereo samples.
+// sliceStreamer is a simple implementation of beep.Streamer that streams a slice of stereo samples.
 type sliceStreamer struct {
 	buf [][2]float64
 	pos int
@@ -280,7 +342,7 @@ func (s *sliceStreamer) Err() error {
 	return nil
 }
 
-// saveWAV synthesizes the beat and writes it as a WAV file.
+// saveWAV synthesizes the audio beat and writes it as a WAV file.
 func saveWAV(filename string, durationSec float64, drumPattern []uint8, chords [][]uint8) error {
 	samples := synthesizeBeat(durationSec, drumPattern, chords)
 	streamer := &sliceStreamer{buf: samples}
@@ -297,27 +359,39 @@ func saveWAV(filename string, durationSec float64, drumPattern []uint8, chords [
 	return wav.Encode(f, streamer, format)
 }
 
-// ----- main -----
+// =======================
+// Main
+// =======================
+
 func main() {
+	// Define a command-line flag to set the track duration.
+	durationPtr := flag.Float64("duration", 10.0, "Duration of the track in seconds")
+	flag.Parse()
+	duration := *durationPtr
+
 	rand.Seed(time.Now().UnixNano())
 
-	// Generate our musical patterns.
+	// Generate file names based on the current date/time.
+	now := time.Now()
+	timestamp := now.Format("2006-01-02_15-04-05")
+	midiFilename := fmt.Sprintf("lofi_beat_%s.mid", timestamp)
+	wavFilename := fmt.Sprintf("lofi_beat_%s.wav", timestamp)
+
 	drumPattern := generateDrumPattern()
 	chords := generateChordProgression()
-	duration := 10.0 // seconds
 
 	// Save MIDI file.
-	if err := saveMIDI("lofi_beat.mid", drumPattern, chords); err != nil {
+	if err := saveMIDI(midiFilename, duration, drumPattern, chords); err != nil {
 		fmt.Println("Error saving MIDI:", err)
 	} else {
-		fmt.Println("MIDI file saved as lofi_beat.mid")
+		fmt.Printf("MIDI file saved as %s\n", midiFilename)
 	}
 
 	// Save WAV file.
-	if err := saveWAV("lofi_beat.wav", duration, drumPattern, chords); err != nil {
+	if err := saveWAV(wavFilename, duration, drumPattern, chords); err != nil {
 		fmt.Println("Error saving WAV:", err)
 	} else {
-		fmt.Println("WAV file saved as lofi_beat.wav")
+		fmt.Printf("WAV file saved as %s\n", wavFilename)
 	}
 }
 
